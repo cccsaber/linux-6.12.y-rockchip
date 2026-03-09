@@ -1,0 +1,282 @@
+name: RK3528 HDMI CI
+
+on:
+  push:
+    paths:
+      - "drivers/phy/rockchip/phy-rockchip-inno-hdmi.c"
+      - "drivers/gpu/drm/rockchip/dw_hdmi-rockchip.c"
+      - "drivers/phy/rockchip/Kconfig"
+      - "drivers/phy/rockchip/Makefile"
+      - "drivers/gpu/drm/rockchip/Kconfig"
+      - "drivers/gpu/drm/rockchip/Makefile"
+      - "arch/arm64/boot/dts/rockchip/rk3528*.dts*"
+      - "arch/arm64/boot/dts/rockchip/Makefile"
+      - ".github/workflows/rk3528-hdmi-ci.yml"
+  pull_request:
+    paths:
+      - "drivers/phy/rockchip/phy-rockchip-inno-hdmi.c"
+      - "drivers/gpu/drm/rockchip/dw_hdmi-rockchip.c"
+      - "drivers/phy/rockchip/Kconfig"
+      - "drivers/phy/rockchip/Makefile"
+      - "drivers/gpu/drm/rockchip/Kconfig"
+      - "drivers/gpu/drm/rockchip/Makefile"
+      - "arch/arm64/boot/dts/rockchip/rk3528*.dts*"
+      - "arch/arm64/boot/dts/rockchip/Makefile"
+      - ".github/workflows/rk3528-hdmi-ci.yml"
+  workflow_dispatch:
+    inputs:
+      upstream_repo:
+        description: "Full kernel source used as the CI build base"
+        required: false
+        default: "https://github.com/cccsaber/linux-6.12.y.git"
+      upstream_ref:
+        description: "Git ref to clone from the build base repo"
+        required: false
+        default: "main"
+
+concurrency:
+  group: rk3528-hdmi-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  ARCH: arm64
+  CROSS_COMPILE: aarch64-linux-gnu-
+
+jobs:
+  obj-build:
+    name: Object Build
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout overlay tree
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            bc \
+            binutils-aarch64-linux-gnu \
+            bison \
+            build-essential \
+            ccache \
+            cpio \
+            device-tree-compiler \
+            dwarves \
+            file \
+            flex \
+            gcc-aarch64-linux-gnu \
+            libelf-dev \
+            libssl-dev \
+            make \
+            python3 \
+            rsync \
+            xz-utils
+
+      - name: Fetch full kernel source
+        env:
+          BUILD_DIR: ${{ github.workspace }}/linux-full
+          UPSTREAM_REPO_INPUT: ${{ github.event.inputs.upstream_repo }}
+          UPSTREAM_REF_INPUT: ${{ github.event.inputs.upstream_ref }}
+        run: |
+          set -euxo pipefail
+          repo="${UPSTREAM_REPO_INPUT:-https://github.com/cccsaber/linux-6.12.y.git}"
+          ref="${UPSTREAM_REF_INPUT:-}"
+
+          if [ -n "$ref" ]; then
+            git clone --depth=1 --branch "$ref" "$repo" "$BUILD_DIR"
+          else
+            git clone --depth=1 "$repo" "$BUILD_DIR"
+          fi
+
+          rsync -a \
+            --exclude '.git/' \
+            --exclude '.github/' \
+            --exclude 'out/' \
+            "$GITHUB_WORKSPACE/" "$BUILD_DIR/"
+
+      - name: Build RK3528 HDMI objects
+        env:
+          BUILD_DIR: ${{ github.workspace }}/linux-full
+          OUT_DIR: ${{ github.workspace }}/out/obj
+        run: |
+          set -euxo pipefail
+          mkdir -p "$OUT_DIR"
+
+          make -C "$BUILD_DIR" \
+            O="$OUT_DIR" \
+            ARCH="$ARCH" \
+            CROSS_COMPILE="$CROSS_COMPILE" \
+            defconfig
+
+          "$BUILD_DIR"/scripts/config --file "$OUT_DIR/.config" \
+            -e ARCH_ROCKCHIP \
+            -e ROCKCHIP_IOMMU \
+            -e DRM \
+            -e DRM_ROCKCHIP \
+            -e ROCKCHIP_VOP \
+            -e ROCKCHIP_VOP2 \
+            -e ROCKCHIP_DW_HDMI \
+            -e PHY_ROCKCHIP_INNO_HDMI
+
+          make -C "$BUILD_DIR" \
+            O="$OUT_DIR" \
+            ARCH="$ARCH" \
+            CROSS_COMPILE="$CROSS_COMPILE" \
+            olddefconfig
+
+          make -C "$BUILD_DIR" \
+            O="$OUT_DIR" \
+            ARCH="$ARCH" \
+            CROSS_COMPILE="$CROSS_COMPILE" \
+            -j"$(nproc)" \
+            W=1 \
+            drivers/phy/rockchip/phy-rockchip-inno-hdmi.o \
+            drivers/gpu/drm/rockchip/dw_hdmi-rockchip.o \
+            2>&1 | tee "$GITHUB_WORKSPACE/obj-build.log"
+
+      - name: Upload object build artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rk3528-hdmi-obj-build
+          if-no-files-found: warn
+          retention-days: 7
+          path: |
+            ${{ github.workspace }}/obj-build.log
+            ${{ github.workspace }}/out/obj/.config
+            ${{ github.workspace }}/out/obj/drivers/phy/rockchip/phy-rockchip-inno-hdmi.o
+            ${{ github.workspace }}/out/obj/drivers/phy/rockchip/.phy-rockchip-inno-hdmi.o.cmd
+            ${{ github.workspace }}/out/obj/drivers/gpu/drm/rockchip/dw_hdmi-rockchip.o
+            ${{ github.workspace }}/out/obj/drivers/gpu/drm/rockchip/.dw_hdmi-rockchip.o.cmd
+
+  arm64-image-dtbs:
+    name: Arm64 Image And RK3528 DTBs
+    runs-on: ubuntu-24.04
+    needs: obj-build
+
+    steps:
+      - name: Checkout overlay tree
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            bc \
+            binutils-aarch64-linux-gnu \
+            bison \
+            build-essential \
+            ccache \
+            cpio \
+            device-tree-compiler \
+            dwarves \
+            file \
+            flex \
+            gcc-aarch64-linux-gnu \
+            libelf-dev \
+            libssl-dev \
+            make \
+            python3 \
+            rsync \
+            xz-utils
+
+      - name: Fetch full kernel source
+        env:
+          BUILD_DIR: ${{ github.workspace }}/linux-full
+          UPSTREAM_REPO_INPUT: ${{ github.event.inputs.upstream_repo }}
+          UPSTREAM_REF_INPUT: ${{ github.event.inputs.upstream_ref }}
+        run: |
+          set -euxo pipefail
+          repo="${UPSTREAM_REPO_INPUT:-https://github.com/cccsaber/linux-6.12.y.git}"
+          ref="${UPSTREAM_REF_INPUT:-}"
+
+          if [ -n "$ref" ]; then
+            git clone --depth=1 --branch "$ref" "$repo" "$BUILD_DIR"
+          else
+            git clone --depth=1 "$repo" "$BUILD_DIR"
+          fi
+
+          rsync -a \
+            --exclude '.git/' \
+            --exclude '.github/' \
+            --exclude 'out/' \
+            "$GITHUB_WORKSPACE/" "$BUILD_DIR/"
+
+      - name: Build arm64 Image and RK3528 DTBs
+        env:
+          BUILD_DIR: ${{ github.workspace }}/linux-full
+          OUT_DIR: ${{ github.workspace }}/out/arm64
+        run: |
+          set -euxo pipefail
+          mkdir -p "$OUT_DIR"
+
+          make -C "$BUILD_DIR" \
+            O="$OUT_DIR" \
+            ARCH="$ARCH" \
+            CROSS_COMPILE="$CROSS_COMPILE" \
+            defconfig
+
+          "$BUILD_DIR"/scripts/config --file "$OUT_DIR/.config" \
+            -e ARCH_ROCKCHIP \
+            -e ROCKCHIP_IOMMU \
+            -e DRM \
+            -e DRM_ROCKCHIP \
+            -e ROCKCHIP_VOP \
+            -e ROCKCHIP_VOP2 \
+            -e ROCKCHIP_DW_HDMI \
+            -e PHY_ROCKCHIP_INNO_HDMI
+
+          make -C "$BUILD_DIR" \
+            O="$OUT_DIR" \
+            ARCH="$ARCH" \
+            CROSS_COMPILE="$CROSS_COMPILE" \
+            olddefconfig
+
+          make -C "$BUILD_DIR" \
+            O="$OUT_DIR" \
+            ARCH="$ARCH" \
+            CROSS_COMPILE="$CROSS_COMPILE" \
+            -j"$(nproc)" \
+            W=1 \
+            Image \
+            2>&1 | tee "$GITHUB_WORKSPACE/image-build.log"
+
+          make -C "$BUILD_DIR" \
+            O="$OUT_DIR" \
+            ARCH="$ARCH" \
+            CROSS_COMPILE="$CROSS_COMPILE" \
+            -j"$(nproc)" \
+            arch/arm64/boot/dts/rockchip/rk3528-armsom-sige1.dtb \
+            arch/arm64/boot/dts/rockchip/rk3528-hlink-h28k.dtb \
+            arch/arm64/boot/dts/rockchip/rk3528-nanopi-zero2.dtb \
+            arch/arm64/boot/dts/rockchip/rk3528-radxa-e20c.dtb \
+            arch/arm64/boot/dts/rockchip/rk3528-radxa-e24c.dtb \
+            arch/arm64/boot/dts/rockchip/rk3528-radxa-e24c-dsa.dtb \
+            arch/arm64/boot/dts/rockchip/rk3528-rock-2a.dtb \
+            arch/arm64/boot/dts/rockchip/rk3528-rock-2f.dtb \
+            arch/arm64/boot/dts/rockchip/rk3528-yixun-rs6pro.dtb \
+            2>&1 | tee "$GITHUB_WORKSPACE/dtb-build.log"
+
+      - name: Upload arm64 build artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rk3528-hdmi-arm64
+          if-no-files-found: warn
+          retention-days: 7
+          path: |
+            ${{ github.workspace }}/image-build.log
+            ${{ github.workspace }}/dtb-build.log
+            ${{ github.workspace }}/out/arm64/.config
+            ${{ github.workspace }}/out/arm64/arch/arm64/boot/Image
+            ${{ github.workspace }}/out/arm64/arch/arm64/boot/dts/rockchip/rk3528-*.dtb
