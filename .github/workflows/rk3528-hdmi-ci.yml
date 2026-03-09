@@ -128,16 +128,18 @@ jobs:
                 -e PHY_ROCKCHIP_INNO_HDMI
               )
               dtb_targets=(
-                arch/arm64/boot/dts/rockchip/rk3528-armsom-sige1.dtb
-                arch/arm64/boot/dts/rockchip/rk3528-hlink-h28k.dtb
-                arch/arm64/boot/dts/rockchip/rk3528-nanopi-zero2.dtb
-                arch/arm64/boot/dts/rockchip/rk3528-radxa-e20c.dtb
-                arch/arm64/boot/dts/rockchip/rk3528-radxa-e24c.dtb
-                arch/arm64/boot/dts/rockchip/rk3528-radxa-e24c-dsa.dtb
-                arch/arm64/boot/dts/rockchip/rk3528-rock-2a.dtb
-                arch/arm64/boot/dts/rockchip/rk3528-rock-2f.dtb
-                arch/arm64/boot/dts/rockchip/rk3528-yixun-rs6pro.dtb
+                rk3528-armsom-sige1.dtb
+                rk3528-hlink-h28k.dtb
+                rk3528-nanopi-zero2.dtb
+                rk3528-radxa-e20c.dtb
+                rk3528-radxa-e24c.dtb
+                rk3528-radxa-e24c-dsa.dtb
+                rk3528-rock-2a.dtb
+                rk3528-rock-2f.dtb
+                rk3528-yixun-rs6pro.dtb
               )
+              dtb_build_targets=("${dtb_targets[@]/#/rockchip/}")
+              dtb_stage_mode="list"
               dtb_source_dir="$OUT_DIR/arch/arm64/boot/dts/rockchip"
               ;;
             amlogic)
@@ -147,6 +149,8 @@ jobs:
                 -e ARCH_MESON
               )
               dtb_targets=(dtbs)
+              dtb_build_targets=("${dtb_targets[@]}")
+              dtb_stage_mode="dir"
               dtb_source_dir="$OUT_DIR/arch/arm64/boot/dts/amlogic"
               ;;
             allwinner)
@@ -156,6 +160,8 @@ jobs:
                 -e ARCH_SUNXI
               )
               dtb_targets=(dtbs)
+              dtb_build_targets=("${dtb_targets[@]}")
+              dtb_stage_mode="dir"
               dtb_source_dir="$OUT_DIR/arch/arm64/boot/dts/allwinner"
               ;;
             *)
@@ -235,8 +241,21 @@ jobs:
             CROSS_COMPILE="$CROSS_COMPILE" \
             -j"$(nproc)" \
             W=1 \
-            "${dtb_targets[@]}" \
+            "${dtb_build_targets[@]}" \
             2>&1 | tee "$REPORT_DIR/dtb-build.log"
+
+          if [ "$dtb_stage_mode" = "list" ]; then
+            for dtb in "${dtb_targets[@]}"; do
+              cp "$dtb_source_dir/$dtb" "$DTB_STAGE/"
+            done
+          else
+            rsync -a \
+              --include '*/' \
+              --include '*.dtb' \
+              --include '*.dtbo' \
+              --exclude '*' \
+              "$dtb_source_dir/" "$DTB_STAGE/"
+          fi
 
           cp "$OUT_DIR/arch/arm64/boot/Image" "$BOOT_STAGE/vmlinuz-$KERNEL_RELEASE"
           cp "$OUT_DIR/System.map" "$BOOT_STAGE/System.map-$KERNEL_RELEASE"
