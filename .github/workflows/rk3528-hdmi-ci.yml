@@ -275,13 +275,13 @@ jobs:
             mkdir -p "$STAGE_DIR/initrd"/{bin,dev,proc,sys,newroot}
             cp "$(command -v busybox)" "$STAGE_DIR/initrd/bin/busybox"
             ln -sf busybox "$STAGE_DIR/initrd/bin/sh"
-            cat >"$STAGE_DIR/initrd/init" <<'EOF'
-#!/bin/sh
-mount -t proc proc /proc
-mount -t sysfs sysfs /sys
-echo "FnNAS placeholder initramfs for recovery/debug only"
-exec /bin/sh
-EOF
+            printf '%s\n' \
+              '#!/bin/sh' \
+              'mount -t proc proc /proc' \
+              'mount -t sysfs sysfs /sys' \
+              'echo "FnNAS placeholder initramfs for recovery/debug only"' \
+              'exec /bin/sh' \
+              > "$STAGE_DIR/initrd/init"
             chmod +x "$STAGE_DIR/initrd/init"
             (
               cd "$STAGE_DIR/initrd"
@@ -327,10 +327,10 @@ EOF
             cp "$OUT_DIR/drivers/gpu/drm/rockchip/dw_hdmi-rockchip.o" "$REPORT_DIR/"
           fi
           if [ "$RELEASE_READY" != "true" ]; then
-            cat >"$REPORT_DIR/release-note.txt" <<EOF
-No exact boot bundle was found in ${fnnas_repo}/releases/tag/kernel_fnnas for ${PACKAGE_NAME}.
-This run generated a placeholder initrd/uInitrd, so the result stays as a workflow artifact only.
-EOF
+            printf '%s\n' \
+              "No exact boot bundle was found in ${fnnas_repo}/releases/tag/kernel_fnnas for ${PACKAGE_NAME}." \
+              "This run generated a placeholder initrd/uInitrd, so the result stays as a workflow artifact only." \
+              > "$REPORT_DIR/release-note.txt"
           fi
 
           (
