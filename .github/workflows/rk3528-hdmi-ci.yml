@@ -1,30 +1,18 @@
-name: RK3528 HDMI CI
+name: Build linux-6.12.y
 
 on:
-  push:
-    paths:
-      - "drivers/phy/rockchip/phy-rockchip-inno-hdmi.c"
-      - "drivers/gpu/drm/rockchip/dw_hdmi-rockchip.c"
-      - "drivers/phy/rockchip/Kconfig"
-      - "drivers/phy/rockchip/Makefile"
-      - "drivers/gpu/drm/rockchip/Kconfig"
-      - "drivers/gpu/drm/rockchip/Makefile"
-      - "arch/arm64/boot/dts/rockchip/rk3528*.dts*"
-      - "arch/arm64/boot/dts/rockchip/Makefile"
-      - ".github/workflows/rk3528-hdmi-ci.yml"
-  pull_request:
-    paths:
-      - "drivers/phy/rockchip/phy-rockchip-inno-hdmi.c"
-      - "drivers/gpu/drm/rockchip/dw_hdmi-rockchip.c"
-      - "drivers/phy/rockchip/Kconfig"
-      - "drivers/phy/rockchip/Makefile"
-      - "drivers/gpu/drm/rockchip/Kconfig"
-      - "drivers/gpu/drm/rockchip/Makefile"
-      - "arch/arm64/boot/dts/rockchip/rk3528*.dts*"
-      - "arch/arm64/boot/dts/rockchip/Makefile"
-      - ".github/workflows/rk3528-hdmi-ci.yml"
+  repository_dispatch:
   workflow_dispatch:
     inputs:
+      platform:
+        description: "Select fnnas kernel platform"
+        required: false
+        default: "rockchip"
+        type: choice
+        options:
+          - rockchip
+          - amlogic
+          - allwinner
       upstream_repo:
         description: "Full kernel source used as the CI build base"
         required: false
@@ -33,38 +21,42 @@ on:
         description: "Git ref to clone from the build base repo"
         required: false
         default: "main"
+      fnnas_repo:
+        description: "FnNAS repo used to reuse matching boot initrd when available"
+        required: false
+        default: "ophub/fnnas"
 
 concurrency:
-  group: rk3528-hdmi-${{ github.workflow }}-${{ github.ref }}
+  group: linux-6.12.y-${{ github.workflow }}-${{ github.ref }}-${{ github.event.inputs.platform || 'rockchip' }}
   cancel-in-progress: true
 
 permissions:
-  contents: read
+  contents: write
 
 env:
-  ARCH: arm64
-  CROSS_COMPILE: aarch64-linux-gnu-
+  TZ: Etc/UTC
 
 jobs:
-  obj-build:
-    name: Object Build
+  build:
     runs-on: ubuntu-24.04
+    if: ${{ github.event.repository.owner.id == github.event.sender.id }}
 
     steps:
-      - name: Checkout overlay tree
-        uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v6
 
-      - name: Install build dependencies
+      - name: Initialization environment
         env:
           DEBIAN_FRONTEND: noninteractive
         run: |
           set -euxo pipefail
-          sudo apt-get update
-          sudo apt-get install -y \
+          sudo -E apt-get -y update
+          sudo -E apt-get -y install \
             bc \
             binutils-aarch64-linux-gnu \
             bison \
             build-essential \
+            busybox-static \
             ccache \
             cpio \
             device-tree-compiler \
@@ -72,22 +64,39 @@ jobs:
             file \
             flex \
             gcc-aarch64-linux-gnu \
+            git \
+            kmod \
             libelf-dev \
             libssl-dev \
             make \
             python3 \
             rsync \
+            u-boot-tools \
             xz-utils
 
-      - name: Fetch full kernel source
+      - name: Build fnnas-style kernel bundle
+        id: package
         env:
-          BUILD_DIR: ${{ github.workspace }}/linux-full
+          ARCH: arm64
+          CROSS_COMPILE: aarch64-linux-gnu-
+          BUILD_DIR: ${{ runner.temp }}/linux-full
+          OUT_DIR: ${{ runner.temp }}/out/arm64
+          STAGE_DIR: ${{ runner.temp }}/fnnas-kernel
+          PLATFORM_INPUT: ${{ github.event.inputs.platform }}
           UPSTREAM_REPO_INPUT: ${{ github.event.inputs.upstream_repo }}
           UPSTREAM_REF_INPUT: ${{ github.event.inputs.upstream_ref }}
+          FNNAS_REPO_INPUT: ${{ github.event.inputs.fnnas_repo }}
         run: |
           set -euxo pipefail
+          shopt -s nullglob
+
+          platform="${PLATFORM_INPUT:-rockchip}"
           repo="${UPSTREAM_REPO_INPUT:-https://github.com/cccsaber/linux-6.12.y.git}"
-          ref="${UPSTREAM_REF_INPUT:-}"
+          ref="${UPSTREAM_REF_INPUT:-main}"
+          fnnas_repo="${FNNAS_REPO_INPUT:-ophub/fnnas}"
+
+          rm -rf "$BUILD_DIR" "$OUT_DIR" "$STAGE_DIR"
+          mkdir -p "$OUT_DIR" "$STAGE_DIR" "$GITHUB_WORKSPACE/package" "$GITHUB_WORKSPACE/fnnas/out"
 
           if [ -n "$ref" ]; then
             git clone --depth=1 --branch "$ref" "$repo" "$BUILD_DIR"
@@ -98,16 +107,62 @@ jobs:
           rsync -a \
             --exclude '.git/' \
             --exclude '.github/' \
+            --exclude 'linux-full/' \
             --exclude 'out/' \
+            --exclude 'package/' \
+            --exclude 'fnnas/' \
             "$GITHUB_WORKSPACE/" "$BUILD_DIR/"
 
-      - name: Build RK3528 HDMI objects
-        env:
-          BUILD_DIR: ${{ github.workspace }}/linux-full
-          OUT_DIR: ${{ github.workspace }}/out/obj
-        run: |
-          set -euxo pipefail
-          mkdir -p "$OUT_DIR"
+          case "$platform" in
+            rockchip)
+              config_args=(
+                -e MODULES
+                -e BLK_DEV_INITRD
+                -e ARCH_ROCKCHIP
+                -e ROCKCHIP_IOMMU
+                -e DRM
+                -e DRM_ROCKCHIP
+                -e ROCKCHIP_VOP
+                -e ROCKCHIP_VOP2
+                -e ROCKCHIP_DW_HDMI
+                -e PHY_ROCKCHIP_INNO_HDMI
+              )
+              dtb_targets=(
+                arch/arm64/boot/dts/rockchip/rk3528-armsom-sige1.dtb
+                arch/arm64/boot/dts/rockchip/rk3528-hlink-h28k.dtb
+                arch/arm64/boot/dts/rockchip/rk3528-nanopi-zero2.dtb
+                arch/arm64/boot/dts/rockchip/rk3528-radxa-e20c.dtb
+                arch/arm64/boot/dts/rockchip/rk3528-radxa-e24c.dtb
+                arch/arm64/boot/dts/rockchip/rk3528-radxa-e24c-dsa.dtb
+                arch/arm64/boot/dts/rockchip/rk3528-rock-2a.dtb
+                arch/arm64/boot/dts/rockchip/rk3528-rock-2f.dtb
+                arch/arm64/boot/dts/rockchip/rk3528-yixun-rs6pro.dtb
+              )
+              dtb_source_dir="$OUT_DIR/arch/arm64/boot/dts/rockchip"
+              ;;
+            amlogic)
+              config_args=(
+                -e MODULES
+                -e BLK_DEV_INITRD
+                -e ARCH_MESON
+              )
+              dtb_targets=(dtbs)
+              dtb_source_dir="$OUT_DIR/arch/arm64/boot/dts/amlogic"
+              ;;
+            allwinner)
+              config_args=(
+                -e MODULES
+                -e BLK_DEV_INITRD
+                -e ARCH_SUNXI
+              )
+              dtb_targets=(dtbs)
+              dtb_source_dir="$OUT_DIR/arch/arm64/boot/dts/allwinner"
+              ;;
+            *)
+              echo "Unsupported platform: $platform" >&2
+              exit 1
+              ;;
+          esac
 
           make -C "$BUILD_DIR" \
             O="$OUT_DIR" \
@@ -116,14 +171,9 @@ jobs:
             defconfig
 
           "$BUILD_DIR"/scripts/config --file "$OUT_DIR/.config" \
-            -e ARCH_ROCKCHIP \
-            -e ROCKCHIP_IOMMU \
-            -e DRM \
-            -e DRM_ROCKCHIP \
-            -e ROCKCHIP_VOP \
-            -e ROCKCHIP_VOP2 \
-            -e ROCKCHIP_DW_HDMI \
-            -e PHY_ROCKCHIP_INNO_HDMI
+            --set-str LOCALVERSION "-trim" \
+            -d LOCALVERSION_AUTO \
+            "${config_args[@]}"
 
           make -C "$BUILD_DIR" \
             O="$OUT_DIR" \
@@ -135,112 +185,38 @@ jobs:
             O="$OUT_DIR" \
             ARCH="$ARCH" \
             CROSS_COMPILE="$CROSS_COMPILE" \
-            -j"$(nproc)" \
-            W=1 \
-            drivers/phy/rockchip/phy-rockchip-inno-hdmi.o \
-            drivers/gpu/drm/rockchip/dw_hdmi-rockchip.o \
-            2>&1 | tee "$GITHUB_WORKSPACE/obj-build.log"
+            prepare modules_prepare
 
-      - name: Upload object build artifacts
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: rk3528-hdmi-obj-build
-          if-no-files-found: warn
-          retention-days: 7
-          path: |
-            ${{ github.workspace }}/obj-build.log
-            ${{ github.workspace }}/out/obj/.config
-            ${{ github.workspace }}/out/obj/drivers/phy/rockchip/phy-rockchip-inno-hdmi.o
-            ${{ github.workspace }}/out/obj/drivers/phy/rockchip/.phy-rockchip-inno-hdmi.o.cmd
-            ${{ github.workspace }}/out/obj/drivers/gpu/drm/rockchip/dw_hdmi-rockchip.o
-            ${{ github.workspace }}/out/obj/drivers/gpu/drm/rockchip/.dw_hdmi-rockchip.o.cmd
+          KERNEL_RELEASE="$(make -s -C "$BUILD_DIR" O="$OUT_DIR" ARCH="$ARCH" CROSS_COMPILE="$CROSS_COMPILE" kernelrelease)"
+          KERNEL_BASE="${KERNEL_RELEASE%%-*}"
+          PACKAGE_NAME="${KERNEL_BASE}-${platform}"
+          PACKAGE_DIR="$GITHUB_WORKSPACE/package/$PACKAGE_NAME"
+          REPORT_DIR="$GITHUB_WORKSPACE/package/${PACKAGE_NAME}-report"
+          BUNDLE_DIR="$GITHUB_WORKSPACE/fnnas/out"
+          BUNDLE_PATH="$BUNDLE_DIR/${PACKAGE_NAME}.tar.gz"
+          MODULES_ROOT="$STAGE_DIR/modules-root"
+          BOOT_STAGE="$STAGE_DIR/boot"
+          DTB_STAGE="$STAGE_DIR/dtb"
+          MODULES_STAGE="$STAGE_DIR/modules"
+          HEADERS_STAGE="$STAGE_DIR/headers"
+          REFERENCE_DIR="$STAGE_DIR/reference"
+          INITRD_SOURCE="generated"
+          RELEASE_READY="false"
 
-  arm64-image-dtbs:
-    name: Arm64 Image And RK3528 DTBs
-    runs-on: ubuntu-24.04
-    needs: obj-build
+          rm -rf "$PACKAGE_DIR" "$REPORT_DIR" "$BUNDLE_PATH"
+          mkdir -p "$PACKAGE_DIR" "$REPORT_DIR" "$MODULES_ROOT" "$BOOT_STAGE" "$DTB_STAGE" "$MODULES_STAGE" "$HEADERS_STAGE" "$REFERENCE_DIR"
 
-    steps:
-      - name: Checkout overlay tree
-        uses: actions/checkout@v4
-
-      - name: Install build dependencies
-        env:
-          DEBIAN_FRONTEND: noninteractive
-        run: |
-          set -euxo pipefail
-          sudo apt-get update
-          sudo apt-get install -y \
-            bc \
-            binutils-aarch64-linux-gnu \
-            bison \
-            build-essential \
-            ccache \
-            cpio \
-            device-tree-compiler \
-            dwarves \
-            file \
-            flex \
-            gcc-aarch64-linux-gnu \
-            libelf-dev \
-            libssl-dev \
-            make \
-            python3 \
-            rsync \
-            xz-utils
-
-      - name: Fetch full kernel source
-        env:
-          BUILD_DIR: ${{ github.workspace }}/linux-full
-          UPSTREAM_REPO_INPUT: ${{ github.event.inputs.upstream_repo }}
-          UPSTREAM_REF_INPUT: ${{ github.event.inputs.upstream_ref }}
-        run: |
-          set -euxo pipefail
-          repo="${UPSTREAM_REPO_INPUT:-https://github.com/cccsaber/linux-6.12.y.git}"
-          ref="${UPSTREAM_REF_INPUT:-}"
-
-          if [ -n "$ref" ]; then
-            git clone --depth=1 --branch "$ref" "$repo" "$BUILD_DIR"
-          else
-            git clone --depth=1 "$repo" "$BUILD_DIR"
+          if [ "$platform" = "rockchip" ]; then
+            make -C "$BUILD_DIR" \
+              O="$OUT_DIR" \
+              ARCH="$ARCH" \
+              CROSS_COMPILE="$CROSS_COMPILE" \
+              -j"$(nproc)" \
+              W=1 \
+              drivers/phy/rockchip/phy-rockchip-inno-hdmi.o \
+              drivers/gpu/drm/rockchip/dw_hdmi-rockchip.o \
+              2>&1 | tee "$REPORT_DIR/obj-build.log"
           fi
-
-          rsync -a \
-            --exclude '.git/' \
-            --exclude '.github/' \
-            --exclude 'out/' \
-            "$GITHUB_WORKSPACE/" "$BUILD_DIR/"
-
-      - name: Build arm64 Image and RK3528 DTBs
-        env:
-          BUILD_DIR: ${{ github.workspace }}/linux-full
-          OUT_DIR: ${{ github.workspace }}/out/arm64
-        run: |
-          set -euxo pipefail
-          mkdir -p "$OUT_DIR"
-
-          make -C "$BUILD_DIR" \
-            O="$OUT_DIR" \
-            ARCH="$ARCH" \
-            CROSS_COMPILE="$CROSS_COMPILE" \
-            defconfig
-
-          "$BUILD_DIR"/scripts/config --file "$OUT_DIR/.config" \
-            -e ARCH_ROCKCHIP \
-            -e ROCKCHIP_IOMMU \
-            -e DRM \
-            -e DRM_ROCKCHIP \
-            -e ROCKCHIP_VOP \
-            -e ROCKCHIP_VOP2 \
-            -e ROCKCHIP_DW_HDMI \
-            -e PHY_ROCKCHIP_INNO_HDMI
-
-          make -C "$BUILD_DIR" \
-            O="$OUT_DIR" \
-            ARCH="$ARCH" \
-            CROSS_COMPILE="$CROSS_COMPILE" \
-            olddefconfig
 
           make -C "$BUILD_DIR" \
             O="$OUT_DIR" \
@@ -249,34 +225,171 @@ jobs:
             -j"$(nproc)" \
             W=1 \
             Image \
-            2>&1 | tee "$GITHUB_WORKSPACE/image-build.log"
+            modules \
+            2>&1 | tee "$REPORT_DIR/kernel-build.log"
 
           make -C "$BUILD_DIR" \
             O="$OUT_DIR" \
             ARCH="$ARCH" \
             CROSS_COMPILE="$CROSS_COMPILE" \
             -j"$(nproc)" \
-            arch/arm64/boot/dts/rockchip/rk3528-armsom-sige1.dtb \
-            arch/arm64/boot/dts/rockchip/rk3528-hlink-h28k.dtb \
-            arch/arm64/boot/dts/rockchip/rk3528-nanopi-zero2.dtb \
-            arch/arm64/boot/dts/rockchip/rk3528-radxa-e20c.dtb \
-            arch/arm64/boot/dts/rockchip/rk3528-radxa-e24c.dtb \
-            arch/arm64/boot/dts/rockchip/rk3528-radxa-e24c-dsa.dtb \
-            arch/arm64/boot/dts/rockchip/rk3528-rock-2a.dtb \
-            arch/arm64/boot/dts/rockchip/rk3528-rock-2f.dtb \
-            arch/arm64/boot/dts/rockchip/rk3528-yixun-rs6pro.dtb \
-            2>&1 | tee "$GITHUB_WORKSPACE/dtb-build.log"
+            W=1 \
+            "${dtb_targets[@]}" \
+            2>&1 | tee "$REPORT_DIR/dtb-build.log"
 
-      - name: Upload arm64 build artifacts
+          make -C "$BUILD_DIR" \
+            O="$OUT_DIR" \
+            ARCH="$ARCH" \
+            CROSS_COMPILE="$CROSS_COMPILE" \
+            INSTALL_MOD_PATH="$MODULES_ROOT" \
+            INSTALL_MOD_STRIP=1 \
+            modules_install \
+            2>&1 | tee "$REPORT_DIR/modules-install.log"
+
+          depmod -b "$MODULES_ROOT" "$KERNEL_RELEASE" 2>&1 | tee "$REPORT_DIR/depmod.log" || true
+
+          cp "$OUT_DIR/arch/arm64/boot/Image" "$BOOT_STAGE/vmlinuz-$KERNEL_RELEASE"
+          cp "$OUT_DIR/System.map" "$BOOT_STAGE/System.map-$KERNEL_RELEASE"
+          cp "$OUT_DIR/.config" "$BOOT_STAGE/config-$KERNEL_RELEASE"
+
+          if curl -fsSL \
+            "https://github.com/${fnnas_repo}/releases/download/kernel_fnnas/${PACKAGE_NAME}.tar.gz" \
+            -o "$REFERENCE_DIR/${PACKAGE_NAME}.tar.gz"; then
+            tar -xzf "$REFERENCE_DIR/${PACKAGE_NAME}.tar.gz" -C "$REFERENCE_DIR"
+            ref_boot=("$REFERENCE_DIR/$PACKAGE_NAME"/boot-"$platform"-*.tar.gz)
+            if [ "${#ref_boot[@]}" -gt 0 ]; then
+              mkdir -p "$REFERENCE_DIR/boot"
+              tar -xzf "${ref_boot[0]}" -C "$REFERENCE_DIR/boot"
+              ref_initrd=("$REFERENCE_DIR/boot"/initrd.img-*)
+              ref_uinitrd=("$REFERENCE_DIR/boot"/uInitrd-*)
+              if [ "${#ref_initrd[@]}" -gt 0 ] && [ "${#ref_uinitrd[@]}" -gt 0 ]; then
+                cp "${ref_initrd[0]}" "$BOOT_STAGE/initrd.img-$KERNEL_RELEASE"
+                cp "${ref_uinitrd[0]}" "$BOOT_STAGE/uInitrd-$KERNEL_RELEASE"
+                INITRD_SOURCE="reference"
+                RELEASE_READY="true"
+              fi
+            fi
+          fi
+
+          if [ "$INITRD_SOURCE" != "reference" ]; then
+            mkdir -p "$STAGE_DIR/initrd"/{bin,dev,proc,sys,newroot}
+            cp "$(command -v busybox)" "$STAGE_DIR/initrd/bin/busybox"
+            ln -sf busybox "$STAGE_DIR/initrd/bin/sh"
+            cat >"$STAGE_DIR/initrd/init" <<'EOF'
+#!/bin/sh
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+echo "FnNAS placeholder initramfs for recovery/debug only"
+exec /bin/sh
+EOF
+            chmod +x "$STAGE_DIR/initrd/init"
+            (
+              cd "$STAGE_DIR/initrd"
+              find . -print0 | cpio --null -o --format=newc | gzip -9 > "$BOOT_STAGE/initrd.img-$KERNEL_RELEASE"
+            )
+            mkimage \
+              -A arm64 \
+              -O linux \
+              -T ramdisk \
+              -C gzip \
+              -n uInitrd \
+              -d "$BOOT_STAGE/initrd.img-$KERNEL_RELEASE" \
+              "$BOOT_STAGE/uInitrd-$KERNEL_RELEASE"
+          fi
+
+          cp -a "$MODULES_ROOT/lib/modules/$KERNEL_RELEASE" "$MODULES_STAGE/"
+          rm -f "$MODULES_STAGE/$KERNEL_RELEASE/build" "$MODULES_STAGE/$KERNEL_RELEASE/source"
+
+          while IFS= read -r -d '' dtb_file; do
+            cp "$dtb_file" "$DTB_STAGE/"
+          done < <(find "$dtb_source_dir" -type f \( -name '*.dtb' -o -name '*.dtbo' \) -print0)
+
+          rsync -a "$BUILD_DIR/Makefile" "$HEADERS_STAGE/"
+          rsync -a "$BUILD_DIR/Kconfig" "$HEADERS_STAGE/"
+          rsync -a "$BUILD_DIR/scripts/" "$HEADERS_STAGE/scripts/"
+          rsync -a "$BUILD_DIR/include/" "$HEADERS_STAGE/include/"
+          rsync -a --exclude 'boot/' "$BUILD_DIR/arch/arm64/" "$HEADERS_STAGE/arch/arm64/"
+          cp "$OUT_DIR/.config" "$HEADERS_STAGE/.config"
+          cp "$OUT_DIR/Module.symvers" "$HEADERS_STAGE/Module.symvers"
+          cp "$OUT_DIR/System.map" "$HEADERS_STAGE/System.map"
+          rsync -a "$OUT_DIR/include/" "$HEADERS_STAGE/include/"
+          rsync -a "$OUT_DIR/arch/arm64/include/" "$HEADERS_STAGE/arch/arm64/include/"
+          rsync -a "$OUT_DIR/scripts/" "$HEADERS_STAGE/scripts/"
+
+          cp "$OUT_DIR/.config" "$REPORT_DIR/kernel.config"
+          printf '%s\n' "$KERNEL_RELEASE" > "$REPORT_DIR/kernelrelease.txt"
+          printf '%s\n' "$PACKAGE_NAME" > "$REPORT_DIR/package-name.txt"
+          printf '%s\n' "$INITRD_SOURCE" > "$REPORT_DIR/initrd-source.txt"
+          printf '%s\n' "$RELEASE_READY" > "$REPORT_DIR/release-ready.txt"
+          printf '%s\n' "$fnnas_repo" > "$REPORT_DIR/reference-repo.txt"
+          if [ "$platform" = "rockchip" ]; then
+            cp "$OUT_DIR/drivers/phy/rockchip/phy-rockchip-inno-hdmi.o" "$REPORT_DIR/"
+            cp "$OUT_DIR/drivers/gpu/drm/rockchip/dw_hdmi-rockchip.o" "$REPORT_DIR/"
+          fi
+          if [ "$RELEASE_READY" != "true" ]; then
+            cat >"$REPORT_DIR/release-note.txt" <<EOF
+No exact boot bundle was found in ${fnnas_repo}/releases/tag/kernel_fnnas for ${PACKAGE_NAME}.
+This run generated a placeholder initrd/uInitrd, so the result stays as a workflow artifact only.
+EOF
+          fi
+
+          (
+            cd "$BOOT_STAGE"
+            tar -czf "$PACKAGE_DIR/boot-$platform-$KERNEL_RELEASE.tar.gz" *
+          )
+          (
+            cd "$DTB_STAGE"
+            tar -czf "$PACKAGE_DIR/dtb-$platform-$KERNEL_RELEASE.tar.gz" *
+          )
+          (
+            cd "$MODULES_STAGE"
+            tar -czf "$PACKAGE_DIR/modules-$platform-$KERNEL_RELEASE.tar.gz" *
+          )
+          (
+            cd "$HEADERS_STAGE"
+            tar -czf "$PACKAGE_DIR/header-$platform-$KERNEL_RELEASE.tar.gz" *
+          )
+
+          (
+            cd "$PACKAGE_DIR"
+            sha256sum * > sha256sums
+          )
+
+          tar -czf "$BUNDLE_PATH" -C "$GITHUB_WORKSPACE/package" "$PACKAGE_NAME"
+
+          {
+            echo "bundle_name=$PACKAGE_NAME"
+            echo "bundle_path=$BUNDLE_PATH"
+            echo "package_dir=$PACKAGE_DIR"
+            echo "report_dir=$REPORT_DIR"
+            echo "kernel_release=$KERNEL_RELEASE"
+            echo "initrd_source=$INITRD_SOURCE"
+            echo "release_ready=$RELEASE_READY"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Upload kernel bundle to release
+        if: ${{ !cancelled() && steps.package.outputs.release_ready == 'true' }}
+        uses: ncipollo/release-action@main
+        with:
+          tag: kernel_fnnas
+          artifacts: ${{ steps.package.outputs.bundle_path }}
+          allowUpdates: true
+          removeArtifacts: false
+          replacesArtifacts: true
+          makeLatest: false
+          token: ${{ secrets.GITHUB_TOKEN }}
+          body: |
+            - FnNAS-style kernel bundle built from `linux-6.12.y`.
+            - Use this repository as `kernel_repo` in FnNAS tooling when consuming `${{ steps.package.outputs.bundle_name }}`.
+
+      - name: Upload build artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: rk3528-hdmi-arm64
+          name: ${{ steps.package.outputs.bundle_name || 'linux-6.12.y-rockchip' }}
           if-no-files-found: warn
           retention-days: 7
           path: |
-            ${{ github.workspace }}/image-build.log
-            ${{ github.workspace }}/dtb-build.log
-            ${{ github.workspace }}/out/arm64/.config
-            ${{ github.workspace }}/out/arm64/arch/arm64/boot/Image
-            ${{ github.workspace }}/out/arm64/arch/arm64/boot/dts/rockchip/rk3528-*.dtb
+            ${{ steps.package.outputs.bundle_path }}
+            ${{ steps.package.outputs.package_dir }}/**
+            ${{ steps.package.outputs.report_dir }}/**
