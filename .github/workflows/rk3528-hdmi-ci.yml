@@ -87,7 +87,7 @@ jobs:
           fnnas_repo="${FNNAS_REPO_INPUT:-ophub/fnnas}"
 
           rm -rf "$BUILD_DIR" "$OUT_DIR" "$STAGE_DIR"
-          mkdir -p "$OUT_DIR" "$STAGE_DIR" "$GITHUB_WORKSPACE/package" "$GITHUB_WORKSPACE/fnnas/out"
+          mkdir -p "$OUT_DIR" "$STAGE_DIR" "$GITHUB_WORKSPACE/fnnas/out"
 
           if [ -n "$ref" ]; then
             git clone --depth=1 --branch "$ref" "$repo" "$BUILD_DIR"
@@ -100,7 +100,6 @@ jobs:
             --exclude '.github/' \
             --exclude 'linux-full/' \
             --exclude 'out/' \
-            --exclude 'package/' \
             --exclude 'fnnas/' \
             "$GITHUB_WORKSPACE/" "$BUILD_DIR/"
 
@@ -156,10 +155,10 @@ jobs:
           KERNEL_RELEASE="$(make -s -C "$BUILD_DIR" O="$OUT_DIR" ARCH="$ARCH" CROSS_COMPILE="$CROSS_COMPILE" kernelrelease)"
           KERNEL_BASE="${KERNEL_RELEASE%%-*}"
           PACKAGE_NAME="${KERNEL_BASE}-${platform}"
-          PACKAGE_DIR="$GITHUB_WORKSPACE/package/$PACKAGE_NAME"
-          REPORT_DIR="$GITHUB_WORKSPACE/package/${PACKAGE_NAME}-report"
           BUNDLE_DIR="$GITHUB_WORKSPACE/fnnas/out"
-          BUNDLE_PATH="$BUNDLE_DIR/${PACKAGE_NAME}.tar.gz"
+          PACKAGE_DIR="$BUNDLE_DIR/$PACKAGE_NAME"
+          REPORT_DIR="$BUNDLE_DIR/${PACKAGE_NAME}-report"
+          BUNDLE_PATH="$RUNNER_TEMP/${PACKAGE_NAME}.tar.gz"
           MODULES_ROOT="$STAGE_DIR/modules-root"
           BOOT_STAGE="$STAGE_DIR/boot"
           DTB_STAGE="$STAGE_DIR/dtb"
@@ -342,13 +341,18 @@ jobs:
             sha256sum * > sha256sums
           )
 
-          tar -czf "$BUNDLE_PATH" -C "$GITHUB_WORKSPACE/package" "$PACKAGE_NAME"
+          if [ "$RELEASE_READY" = "true" ]; then
+            tar -czf "$BUNDLE_PATH" -C "$BUNDLE_DIR" "$PACKAGE_NAME"
+          else
+            : > "$REPORT_DIR/release-bundle-skipped.txt"
+          fi
 
           {
             echo "bundle_name=$PACKAGE_NAME"
             echo "bundle_path=$BUNDLE_PATH"
             echo "package_dir=$PACKAGE_DIR"
             echo "report_dir=$REPORT_DIR"
+            echo "artifact_root=$BUNDLE_DIR"
             echo "kernel_release=$KERNEL_RELEASE"
             echo "initrd_source=$INITRD_SOURCE"
             echo "release_ready=$RELEASE_READY"
@@ -376,7 +380,4 @@ jobs:
           name: ${{ steps.package.outputs.bundle_name || 'linux-6.12.y-rockchip' }}
           if-no-files-found: warn
           retention-days: 7
-          path: |
-            ${{ steps.package.outputs.bundle_path }}
-            ${{ steps.package.outputs.package_dir }}/**
-            ${{ steps.package.outputs.report_dir }}/**
+          path: ${{ steps.package.outputs.artifact_root }}/**
