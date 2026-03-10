@@ -357,11 +357,7 @@ jobs:
               sha256sums
           )
 
-          if [ "$RELEASE_READY" = "true" ]; then
-            cp "$PACKAGE_PATH" "$BUNDLE_PATH"
-          else
-            : > "$REPORT_DIR/release-bundle-skipped.txt"
-          fi
+          cp "$PACKAGE_PATH" "$BUNDLE_PATH"
 
           {
             echo "bundle_name=$PACKAGE_NAME"
@@ -375,7 +371,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Upload kernel bundle to release
-        if: ${{ !cancelled() && steps.package.outputs.release_ready == 'true' }}
+        if: ${{ !cancelled() && steps.package.outcome == 'success' }}
         uses: ncipollo/release-action@main
         with:
           tag: kernel_fnnas
