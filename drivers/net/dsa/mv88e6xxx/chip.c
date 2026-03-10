@@ -27,6 +27,7 @@
 #include <linux/of_irq.h>
 #include <linux/of_mdio.h>
 #include <linux/platform_data/mv88e6xxx.h>
+#include <linux/property.h>
 #include <linux/netdevice.h>
 #include <linux/gpio/consumer.h>
 #include <linux/phylink.h>
@@ -867,7 +868,7 @@ mv88e6xxx_mac_select_pcs(struct phylink_config *config,
 {
 	struct dsa_port *dp = dsa_phylink_to_port(config);
 	struct mv88e6xxx_chip *chip = dp->ds->priv;
-	struct phylink_pcs *pcs = ERR_PTR(-EOPNOTSUPP);
+	struct phylink_pcs *pcs = NULL;
 
 	if (chip->info->ops->pcs_ops)
 		pcs = chip->info->ops->pcs_ops->pcs_select(chip, dp->index,
@@ -1299,9 +1300,6 @@ static size_t mv88e6095_stats_get_stat(struct mv88e6xxx_chip *chip, int port,
 				       const struct mv88e6xxx_hw_stat *stat,
 				       uint64_t *data)
 {
-	if (!(stat->type & (STATS_TYPE_BANK0 | STATS_TYPE_PORT)))
-		return 0;
-
 	*data = _mv88e6xxx_get_ethtool_stat(chip, stat, port, 0,
 					    MV88E6XXX_G1_STATS_OP_HIST_RX);
 	return 1;
@@ -1311,9 +1309,6 @@ static size_t mv88e6250_stats_get_stat(struct mv88e6xxx_chip *chip, int port,
 				       const struct mv88e6xxx_hw_stat *stat,
 				       uint64_t *data)
 {
-	if (!(stat->type & STATS_TYPE_BANK0))
-		return 0;
-
 	*data = _mv88e6xxx_get_ethtool_stat(chip, stat, port, 0,
 					    MV88E6XXX_G1_STATS_OP_HIST_RX);
 	return 1;
@@ -1323,9 +1318,6 @@ static size_t mv88e6320_stats_get_stat(struct mv88e6xxx_chip *chip, int port,
 				       const struct mv88e6xxx_hw_stat *stat,
 				       uint64_t *data)
 {
-	if (!(stat->type & (STATS_TYPE_BANK0 | STATS_TYPE_BANK1)))
-		return 0;
-
 	*data = _mv88e6xxx_get_ethtool_stat(chip, stat, port,
 					    MV88E6XXX_G1_STATS_OP_BANK_1_BIT_9,
 					    MV88E6XXX_G1_STATS_OP_HIST_RX);
@@ -1336,9 +1328,6 @@ static size_t mv88e6390_stats_get_stat(struct mv88e6xxx_chip *chip, int port,
 				       const struct mv88e6xxx_hw_stat *stat,
 				       uint64_t *data)
 {
-	if (!(stat->type & (STATS_TYPE_BANK0 | STATS_TYPE_BANK1)))
-		return 0;
-
 	*data = _mv88e6xxx_get_ethtool_stat(chip, stat, port,
 					    MV88E6XXX_G1_STATS_OP_BANK_1_BIT_10,
 					    0);
@@ -1350,6 +1339,9 @@ static size_t mv88e6xxx_stats_get_stat(struct mv88e6xxx_chip *chip, int port,
 				       uint64_t *data)
 {
 	int ret = 0;
+
+	if (!(stat->type & chip->info->stats_type))
+		return 0;
 
 	if (chip->info->ops->stats_get_stat) {
 		mv88e6xxx_reg_lock(chip);
@@ -1931,36 +1923,9 @@ static int mv88e6xxx_vtu_loadpurge(struct mv88e6xxx_chip *chip,
 	return chip->info->ops->vtu_loadpurge(chip, entry);
 }
 
-static int mv88e6xxx_fid_map_vlan(struct mv88e6xxx_chip *chip,
-				  const struct mv88e6xxx_vtu_entry *entry,
-				  void *_fid_bitmap)
-{
-	unsigned long *fid_bitmap = _fid_bitmap;
-
-	set_bit(entry->fid, fid_bitmap);
-	return 0;
-}
-
-int mv88e6xxx_fid_map(struct mv88e6xxx_chip *chip, unsigned long *fid_bitmap)
-{
-	bitmap_zero(fid_bitmap, MV88E6XXX_N_FID);
-
-	/* Every FID has an associated VID, so walking the VTU
-	 * will discover the full set of FIDs in use.
-	 */
-	return mv88e6xxx_vtu_walk(chip, mv88e6xxx_fid_map_vlan, fid_bitmap);
-}
-
 static int mv88e6xxx_atu_new(struct mv88e6xxx_chip *chip, u16 *fid)
 {
-	DECLARE_BITMAP(fid_bitmap, MV88E6XXX_N_FID);
-	int err;
-
-	err = mv88e6xxx_fid_map(chip, fid_bitmap);
-	if (err)
-		return err;
-
-	*fid = find_first_zero_bit(fid_bitmap, MV88E6XXX_N_FID);
+	*fid = find_first_zero_bit(chip->fid_bitmap, MV88E6XXX_N_FID);
 	if (unlikely(*fid >= mv88e6xxx_num_databases(chip)))
 		return -ENOSPC;
 
@@ -2699,6 +2664,9 @@ static int mv88e6xxx_port_vlan_join(struct mv88e6xxx_chip *chip, int port,
 			 port, vid);
 	}
 
+	/* Record FID used in SW FID map */
+	bitmap_set(chip->fid_bitmap, vlan.fid, 1);
+
 	return 0;
 }
 
@@ -2804,6 +2772,9 @@ static int mv88e6xxx_port_vlan_leave(struct mv88e6xxx_chip *chip,
 		err = mv88e6xxx_mst_put(chip, vlan.sid);
 		if (err)
 			return err;
+
+		/* Record FID freed in SW FID map */
+		bitmap_clear(chip->fid_bitmap, vlan.fid, 1);
 	}
 
 	return mv88e6xxx_g1_atu_remove(chip, vlan.fid, port, false);
@@ -3412,14 +3383,44 @@ static int mv88e6xxx_setup_upstream_port(struct mv88e6xxx_chip *chip, int port)
 static int mv88e6xxx_setup_port(struct mv88e6xxx_chip *chip, int port)
 {
 	struct device_node *phy_handle = NULL;
+	struct fwnode_handle *ports_fwnode;
+	struct fwnode_handle *port_fwnode;
 	struct dsa_switch *ds = chip->ds;
+	struct mv88e6xxx_port *p;
 	struct dsa_port *dp;
 	int tx_amp;
 	int err;
 	u16 reg;
+	u32 val;
 
-	chip->ports[port].chip = chip;
-	chip->ports[port].port = port;
+	p = &chip->ports[port];
+	p->chip = chip;
+	p->port = port;
+
+	/* Look up corresponding fwnode if any */
+	ports_fwnode = device_get_named_child_node(chip->dev, "ethernet-ports");
+	if (!ports_fwnode)
+		ports_fwnode = device_get_named_child_node(chip->dev, "ports");
+	if (ports_fwnode) {
+		fwnode_for_each_child_node(ports_fwnode, port_fwnode) {
+			if (fwnode_property_read_u32(port_fwnode, "reg", &val))
+				continue;
+			if (val == port) {
+				p->fwnode = port_fwnode;
+				p->fiber = fwnode_property_present(port_fwnode, "sfp");
+				break;
+			}
+		}
+		fwnode_handle_put(ports_fwnode);
+	} else {
+		dev_dbg(chip->dev, "no ethernet ports node defined for the device\n");
+	}
+
+	if (chip->info->ops->port_setup_leds) {
+		err = chip->info->ops->port_setup_leds(chip, port);
+		if (err && err != -EOPNOTSUPP)
+			return err;
+	}
 
 	err = mv88e6xxx_port_setup_mac(chip, port, LINK_UNFORCED,
 				       SPEED_UNFORCED, DUPLEX_UNFORCED,
@@ -3551,6 +3552,9 @@ static int mv88e6xxx_setup_port(struct mv88e6xxx_chip *chip, int port)
 		reg = 0;
 	else
 		reg = 1 << port;
+
+	/* Disable ATU member violation interrupt */
+	reg |= MV88E6XXX_PORT_ASSOC_VECTOR_IGNORE_WRONG;
 
 	err = mv88e6xxx_port_write(chip, port, MV88E6XXX_PORT_ASSOC_VECTOR,
 				   reg);
@@ -4653,6 +4657,7 @@ static const struct mv88e6xxx_ops mv88e6172_ops = {
 	.port_disable_learn_limit = mv88e6xxx_port_disable_learn_limit,
 	.port_disable_pri_override = mv88e6xxx_port_disable_pri_override,
 	.port_get_cmode = mv88e6352_port_get_cmode,
+	.port_setup_leds = mv88e6xxx_port_setup_leds,
 	.port_setup_message_port = mv88e6xxx_setup_message_port,
 	.stats_snapshot = mv88e6320_g1_stats_snapshot,
 	.stats_set_histogram = mv88e6095_g1_stats_set_histogram,
@@ -4755,6 +4760,7 @@ static const struct mv88e6xxx_ops mv88e6176_ops = {
 	.port_disable_learn_limit = mv88e6xxx_port_disable_learn_limit,
 	.port_disable_pri_override = mv88e6xxx_port_disable_pri_override,
 	.port_get_cmode = mv88e6352_port_get_cmode,
+	.port_setup_leds = mv88e6xxx_port_setup_leds,
 	.port_setup_message_port = mv88e6xxx_setup_message_port,
 	.stats_snapshot = mv88e6320_g1_stats_snapshot,
 	.stats_set_histogram = mv88e6095_g1_stats_set_histogram,
@@ -5030,6 +5036,7 @@ static const struct mv88e6xxx_ops mv88e6240_ops = {
 	.port_disable_learn_limit = mv88e6xxx_port_disable_learn_limit,
 	.port_disable_pri_override = mv88e6xxx_port_disable_pri_override,
 	.port_get_cmode = mv88e6352_port_get_cmode,
+	.port_setup_leds = mv88e6xxx_port_setup_leds,
 	.port_setup_message_port = mv88e6xxx_setup_message_port,
 	.stats_snapshot = mv88e6320_g1_stats_snapshot,
 	.stats_set_histogram = mv88e6095_g1_stats_set_histogram,
@@ -5460,6 +5467,7 @@ static const struct mv88e6xxx_ops mv88e6352_ops = {
 	.port_disable_learn_limit = mv88e6xxx_port_disable_learn_limit,
 	.port_disable_pri_override = mv88e6xxx_port_disable_pri_override,
 	.port_get_cmode = mv88e6352_port_get_cmode,
+	.port_setup_leds = mv88e6xxx_port_setup_leds,
 	.port_setup_message_port = mv88e6xxx_setup_message_port,
 	.stats_snapshot = mv88e6320_g1_stats_snapshot,
 	.stats_set_histogram = mv88e6095_g1_stats_set_histogram,
@@ -5706,6 +5714,7 @@ static const struct mv88e6xxx_info mv88e6xxx_table[] = {
 		.age_time_coeff = 15000,
 		.g1_irqs = 9,
 		.g2_irqs = 5,
+		.stats_type = STATS_TYPE_BANK0,
 		.atu_move_port_mask = 0xf,
 		.dual_chip = true,
 		.ops = &mv88e6250_ops,
@@ -5726,6 +5735,7 @@ static const struct mv88e6xxx_info mv88e6xxx_table[] = {
 		.age_time_coeff = 15000,
 		.g1_irqs = 9,
 		.g2_irqs = 5,
+		.stats_type = STATS_TYPE_BANK0,
 		.atu_move_port_mask = 0xf,
 		.dual_chip = true,
 		.ops = &mv88e6250_ops,
@@ -5748,6 +5758,7 @@ static const struct mv88e6xxx_info mv88e6xxx_table[] = {
 		.age_time_coeff = 15000,
 		.g1_irqs = 8,
 		.g2_irqs = 10,
+		.stats_type = STATS_TYPE_BANK0 | STATS_TYPE_PORT,
 		.atu_move_port_mask = 0xf,
 		.pvt = true,
 		.multi_chip = true,
@@ -5769,6 +5780,7 @@ static const struct mv88e6xxx_info mv88e6xxx_table[] = {
 		.global2_addr = 0x1c,
 		.age_time_coeff = 15000,
 		.g1_irqs = 8,
+		.stats_type = STATS_TYPE_BANK0 | STATS_TYPE_PORT,
 		.atu_move_port_mask = 0xf,
 		.multi_chip = true,
 		.ops = &mv88e6095_ops,
@@ -5791,6 +5803,7 @@ static const struct mv88e6xxx_info mv88e6xxx_table[] = {
 		.age_time_coeff = 15000,
 		.g1_irqs = 8,
 		.g2_irqs = 10,
+		.stats_type = STATS_TYPE_BANK0 | STATS_TYPE_PORT,
 		.atu_move_port_mask = 0xf,
 		.pvt = true,
 		.multi_chip = true,
@@ -5815,6 +5828,7 @@ static const struct mv88e6xxx_info mv88e6xxx_table[] = {
 		.age_time_coeff = 15000,
 		.g1_irqs = 9,
 		.g2_irqs = 10,
+		.stats_type = STATS_TYPE_BANK0 | STATS_TYPE_PORT,
 		.atu_move_port_mask = 0xf,
 		.pvt = true,
 		.multi_chip = true,
@@ -5837,6 +5851,7 @@ static const struct mv88e6xxx_info mv88e6xxx_table[] = {
 		.global2_addr = 0x1c,
 		.age_time_coeff = 15000,
 		.g1_irqs = 9,
+		.stats_type = STATS_TYPE_BANK0 | STATS_TYPE_PORT,
 		.atu_move_port_mask = 0xf,
 		.multi_chip = true,
 		.ops = &mv88e6131_ops,
@@ -5861,6 +5876,7 @@ static const struct mv88e6xxx_info mv88e6xxx_table[] = {
 		.atu_move_port_mask = 0xf,
 		.g1_irqs = 9,
 		.g2_irqs = 10,
+		.stats_type = STATS_TYPE_BANK0 | STATS_TYPE_BANK1,
 		.pvt = true,
 		.multi_chip = true,
 		.edsa_support = MV88E6XXX_EDSA_SUPPORTED,
@@ -5884,6 +5900,7 @@ static const struct mv88e6xxx_info mv88e6xxx_table[] = {
 		.age_time_coeff = 15000,
 		.g1_irqs = 9,
 		.g2_irqs = 10,
+		.stats_type = STATS_TYPE_BANK0 | STATS_TYPE_PORT,
 		.atu_move_port_mask = 0xf,
 		.pvt = true,
 		.multi_chip = true,
@@ -5909,6 +5926,7 @@ static const struct mv88e6xxx_info mv88e6xxx_table[] = {
 		.age_time_coeff = 15000,
 		.g1_irqs = 9,
 		.g2_irqs = 10,
+		.stats_type = STATS_TYPE_BANK0 | STATS_TYPE_PORT,
 		.atu_move_port_mask = 0xf,
 		.pvt = true,
 		.multi_chip = true,
@@ -5933,6 +5951,7 @@ static const struct mv88e6xxx_info mv88e6xxx_table[] = {
 		.age_time_coeff = 15000,
 		.g1_irqs = 9,
 		.g2_irqs = 10,
+		.stats_type = STATS_TYPE_BANK0 | STATS_TYPE_BANK1,
 		.atu_move_port_mask = 0xf,
 		.pvt = true,
 		.multi_chip = true,
@@ -5958,6 +5977,7 @@ static const struct mv88e6xxx_info mv88e6xxx_table[] = {
 		.age_time_coeff = 15000,
 		.g1_irqs = 9,
 		.g2_irqs = 10,
+		.stats_type = STATS_TYPE_BANK0 | STATS_TYPE_PORT,
 		.atu_move_port_mask = 0xf,
 		.pvt = true,
 		.multi_chip = true,
@@ -5982,6 +6002,7 @@ static const struct mv88e6xxx_info mv88e6xxx_table[] = {
 		.age_time_coeff = 15000,
 		.g1_irqs = 9,
 		.g2_irqs = 10,
+		.stats_type = STATS_TYPE_BANK0 | STATS_TYPE_PORT,
 		.atu_move_port_mask = 0xf,
 		.pvt = true,
 		.multi_chip = true,
@@ -6007,6 +6028,7 @@ static const struct mv88e6xxx_info mv88e6xxx_table[] = {
 		.age_time_coeff = 15000,
 		.g1_irqs = 9,
 		.g2_irqs = 10,
+		.stats_type = STATS_TYPE_BANK0 | STATS_TYPE_PORT,
 		.atu_move_port_mask = 0xf,
 		.pvt = true,
 		.multi_chip = true,
@@ -6029,6 +6051,7 @@ static const struct mv88e6xxx_info mv88e6xxx_table[] = {
 		.global2_addr = 0x1c,
 		.age_time_coeff = 15000,
 		.g1_irqs = 8,
+		.stats_type = STATS_TYPE_BANK0 | STATS_TYPE_PORT,
 		.atu_move_port_mask = 0xf,
 		.multi_chip = true,
 		.edsa_support = MV88E6XXX_EDSA_SUPPORTED,
@@ -6053,6 +6076,7 @@ static const struct mv88e6xxx_info mv88e6xxx_table[] = {
 		.age_time_coeff = 3750,
 		.g1_irqs = 9,
 		.g2_irqs = 14,
+		.stats_type = STATS_TYPE_BANK0 | STATS_TYPE_BANK1,
 		.pvt = true,
 		.multi_chip = true,
 		.atu_move_port_mask = 0x1f,
@@ -6077,6 +6101,7 @@ static const struct mv88e6xxx_info mv88e6xxx_table[] = {
 		.age_time_coeff = 3750,
 		.g1_irqs = 9,
 		.g2_irqs = 14,
+		.stats_type = STATS_TYPE_BANK0 | STATS_TYPE_BANK1,
 		.atu_move_port_mask = 0x1f,
 		.pvt = true,
 		.multi_chip = true,
@@ -6100,6 +6125,7 @@ static const struct mv88e6xxx_info mv88e6xxx_table[] = {
 		.age_time_coeff = 3750,
 		.g1_irqs = 9,
 		.g2_irqs = 14,
+		.stats_type = STATS_TYPE_BANK0 | STATS_TYPE_BANK1,
 		.atu_move_port_mask = 0x1f,
 		.pvt = true,
 		.multi_chip = true,
@@ -6124,6 +6150,7 @@ static const struct mv88e6xxx_info mv88e6xxx_table[] = {
 		.age_time_coeff = 3750,
 		.g1_irqs = 10,
 		.g2_irqs = 14,
+		.stats_type = STATS_TYPE_BANK0 | STATS_TYPE_BANK1,
 		.atu_move_port_mask = 0x1f,
 		.pvt = true,
 		.multi_chip = true,
@@ -6148,6 +6175,7 @@ static const struct mv88e6xxx_info mv88e6xxx_table[] = {
 		.age_time_coeff = 3750,
 		.g1_irqs = 10,
 		.g2_irqs = 14,
+		.stats_type = STATS_TYPE_BANK0 | STATS_TYPE_BANK1,
 		.atu_move_port_mask = 0x1f,
 		.pvt = true,
 		.multi_chip = true,
@@ -6175,6 +6203,7 @@ static const struct mv88e6xxx_info mv88e6xxx_table[] = {
 		.age_time_coeff = 15000,
 		.g1_irqs = 9,
 		.g2_irqs = 10,
+		.stats_type = STATS_TYPE_BANK0,
 		.atu_move_port_mask = 0xf,
 		.dual_chip = true,
 		.ptp_support = true,
@@ -6199,6 +6228,7 @@ static const struct mv88e6xxx_info mv88e6xxx_table[] = {
 		.age_time_coeff = 15000,
 		.g1_irqs = 9,
 		.g2_irqs = 10,
+		.stats_type = STATS_TYPE_BANK0 | STATS_TYPE_PORT,
 		.atu_move_port_mask = 0xf,
 		.pvt = true,
 		.multi_chip = true,
@@ -6222,6 +6252,7 @@ static const struct mv88e6xxx_info mv88e6xxx_table[] = {
 		.age_time_coeff = 15000,
 		.g1_irqs = 9,
 		.g2_irqs = 10,
+		.stats_type = STATS_TYPE_BANK0,
 		.atu_move_port_mask = 0xf,
 		.dual_chip = true,
 		.ptp_support = true,
@@ -6245,6 +6276,7 @@ static const struct mv88e6xxx_info mv88e6xxx_table[] = {
 		.age_time_coeff = 3750,
 		.g1_irqs = 9,
 		.g2_irqs = 14,
+		.stats_type = STATS_TYPE_BANK0 | STATS_TYPE_BANK1,
 		.atu_move_port_mask = 0x1f,
 		.pvt = true,
 		.multi_chip = true,
@@ -6270,6 +6302,7 @@ static const struct mv88e6xxx_info mv88e6xxx_table[] = {
 		.age_time_coeff = 15000,
 		.g1_irqs = 8,
 		.g2_irqs = 10,
+		.stats_type = STATS_TYPE_BANK0 | STATS_TYPE_BANK1,
 		.atu_move_port_mask = 0xf,
 		.pvt = true,
 		.multi_chip = true,
@@ -6296,6 +6329,7 @@ static const struct mv88e6xxx_info mv88e6xxx_table[] = {
 		.age_time_coeff = 15000,
 		.g1_irqs = 8,
 		.g2_irqs = 10,
+		.stats_type = STATS_TYPE_BANK0 | STATS_TYPE_BANK1,
 		.atu_move_port_mask = 0xf,
 		.pvt = true,
 		.multi_chip = true,
@@ -6323,6 +6357,7 @@ static const struct mv88e6xxx_info mv88e6xxx_table[] = {
 		.atu_move_port_mask = 0xf,
 		.g1_irqs = 9,
 		.g2_irqs = 10,
+		.stats_type = STATS_TYPE_BANK0 | STATS_TYPE_BANK1,
 		.pvt = true,
 		.multi_chip = true,
 		.edsa_support = MV88E6XXX_EDSA_SUPPORTED,
@@ -6347,6 +6382,7 @@ static const struct mv88e6xxx_info mv88e6xxx_table[] = {
 		.age_time_coeff = 15000,
 		.g1_irqs = 9,
 		.g2_irqs = 10,
+		.stats_type = STATS_TYPE_BANK0 | STATS_TYPE_PORT,
 		.atu_move_port_mask = 0xf,
 		.pvt = true,
 		.multi_chip = true,
@@ -6371,6 +6407,7 @@ static const struct mv88e6xxx_info mv88e6xxx_table[] = {
 		.age_time_coeff = 15000,
 		.g1_irqs = 9,
 		.g2_irqs = 10,
+		.stats_type = STATS_TYPE_BANK0 | STATS_TYPE_PORT,
 		.atu_move_port_mask = 0xf,
 		.pvt = true,
 		.multi_chip = true,
@@ -6396,6 +6433,7 @@ static const struct mv88e6xxx_info mv88e6xxx_table[] = {
 		.age_time_coeff = 15000,
 		.g1_irqs = 9,
 		.g2_irqs = 10,
+		.stats_type = STATS_TYPE_BANK0 | STATS_TYPE_PORT,
 		.atu_move_port_mask = 0xf,
 		.pvt = true,
 		.multi_chip = true,
@@ -6423,6 +6461,7 @@ static const struct mv88e6xxx_info mv88e6xxx_table[] = {
 		.age_time_coeff = 3750,
 		.g1_irqs = 10,
 		.g2_irqs = 14,
+		.stats_type = STATS_TYPE_BANK0 | STATS_TYPE_BANK1,
 		.atu_move_port_mask = 0x1f,
 		.pvt = true,
 		.multi_chip = true,
@@ -6447,6 +6486,7 @@ static const struct mv88e6xxx_info mv88e6xxx_table[] = {
 		.age_time_coeff = 3750,
 		.g1_irqs = 9,
 		.g2_irqs = 14,
+		.stats_type = STATS_TYPE_BANK0 | STATS_TYPE_BANK1,
 		.atu_move_port_mask = 0x1f,
 		.pvt = true,
 		.multi_chip = true,
@@ -6472,6 +6512,7 @@ static const struct mv88e6xxx_info mv88e6xxx_table[] = {
 		.age_time_coeff = 3750,
 		.g1_irqs = 9,
 		.g2_irqs = 14,
+		.stats_type = STATS_TYPE_BANK0 | STATS_TYPE_BANK1,
 		.atu_move_port_mask = 0x1f,
 		.pvt = true,
 		.multi_chip = true,
@@ -6497,6 +6538,7 @@ static const struct mv88e6xxx_info mv88e6xxx_table[] = {
 		.age_time_coeff = 3750,
 		.g1_irqs = 10,
 		.g2_irqs = 14,
+		.stats_type = STATS_TYPE_BANK0 | STATS_TYPE_BANK1,
 		.atu_move_port_mask = 0x1f,
 		.pvt = true,
 		.multi_chip = true,
