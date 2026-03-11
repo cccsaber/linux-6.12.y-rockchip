@@ -1,7 +1,6 @@
 name: Package linux-6.12.y-rockchip FnNAS bundle
 
 on:
-  repository_dispatch:
   workflow_dispatch:
     inputs:
       upstream_repo:
