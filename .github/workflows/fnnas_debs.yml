@@ -1,7 +1,9 @@
 name: fnnas_debs
 
 on:
-  workflow_dispatch:
+  push:
+    branches:
+      - main
 
 concurrency:
   group: fnnas-debs-${{ github.ref }}
