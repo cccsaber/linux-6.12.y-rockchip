@@ -97,6 +97,8 @@ struct rockchip_hdmi {
 	int hpd_irq;
 };
 
+static struct rockchip_hdmi_chip_data rk3528_chip_data;
+
 static struct rockchip_hdmi *to_rockchip_hdmi(struct drm_encoder *encoder)
 {
 	struct rockchip_encoder *rkencoder = to_rockchip_encoder(encoder);
