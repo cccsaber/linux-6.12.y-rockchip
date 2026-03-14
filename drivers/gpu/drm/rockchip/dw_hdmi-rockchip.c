@@ -4,6 +4,9 @@
  */
 
 #include <linux/clk.h>
+#include <linux/gpio/consumer.h>
+#include <linux/interrupt.h>
+#include <linux/io.h>
 #include <linux/mfd/syscon.h>
 #include <linux/module.h>
 #include <linux/platform_device.h>
@@ -50,6 +53,14 @@
 #define RK3399_GRF_SOC_CON20		0x6250
 #define RK3399_HDMI_LCDC_SEL		BIT(6)
 
+#define RK3528_VO_GRF_HDMI_MASK		0x60014
+#define RK3528_HDMI_SNKDET_SEL		BIT(6)
+#define RK3528_HDMI_SNKDET		BIT(5)
+#define RK3528_HDMI_SDAIN_MSK		BIT(1)
+#define RK3528_HDMI_SCLIN_MSK		BIT(0)
+#define RK3528_GPIO_SWPORT_DR_L		0x0000
+#define RK3528_GPIO0_A2_DR		BIT(2)
+
 #define RK3568_GRF_VO_CON1		0x0364
 #define RK3568_HDMI_SDAIN_MSK		BIT(15)
 #define RK3568_HDMI_SCLIN_MSK		BIT(14)
@@ -81,6 +92,9 @@ struct rockchip_hdmi {
 	struct clk *grf_clk;
 	struct dw_hdmi *hdmi;
 	struct phy *phy;
+	struct gpio_desc *hpd_gpiod;
+	void __iomem *gpio_base;
+	int hpd_irq;
 };
 
 static struct rockchip_hdmi *to_rockchip_hdmi(struct drm_encoder *encoder)
@@ -196,9 +210,63 @@ static const struct dw_hdmi_phy_config rockchip_phy_config[] = {
 	{ ~0UL,	     0x0000, 0x0000, 0x0000}
 };
 
+static irqreturn_t rockchip_hdmi_hpd_irq_handler(int irq, void *arg)
+{
+	struct rockchip_hdmi *hdmi = arg;
+	u32 val;
+
+	val = gpiod_get_value(hdmi->hpd_gpiod);
+	if (val)
+		val = HIWORD_UPDATE(RK3528_HDMI_SNKDET, RK3528_HDMI_SNKDET);
+	else
+		val = HIWORD_UPDATE(0, RK3528_HDMI_SNKDET);
+
+	regmap_write(hdmi->regmap, RK3528_VO_GRF_HDMI_MASK, val);
+
+	return IRQ_HANDLED;
+}
+
+static void dw_hdmi_rk3528_gpio_hpd_init(struct rockchip_hdmi *hdmi)
+{
+	u32 val;
+
+	if (hdmi->hpd_gpiod) {
+		/*
+		 * GPIO0_A2 input enable is gated by the corresponding data bit,
+		 * so drive it high before routing sink detect through the GPIO.
+		 */
+		val = HIWORD_UPDATE(RK3528_GPIO0_A2_DR, RK3528_GPIO0_A2_DR);
+		writel(val, hdmi->gpio_base + RK3528_GPIO_SWPORT_DR_L);
+
+		val = HIWORD_UPDATE(RK3528_HDMI_SNKDET_SEL |
+				    RK3528_HDMI_SDAIN_MSK |
+				    RK3528_HDMI_SCLIN_MSK,
+				    RK3528_HDMI_SNKDET_SEL |
+				    RK3528_HDMI_SDAIN_MSK |
+				    RK3528_HDMI_SCLIN_MSK);
+	} else {
+		val = HIWORD_UPDATE(RK3528_HDMI_SDAIN_MSK |
+				    RK3528_HDMI_SCLIN_MSK,
+				    RK3528_HDMI_SDAIN_MSK |
+				    RK3528_HDMI_SCLIN_MSK);
+	}
+
+	regmap_write(hdmi->regmap, RK3528_VO_GRF_HDMI_MASK, val);
+
+	val = gpiod_get_value(hdmi->hpd_gpiod);
+	if (val)
+		val = HIWORD_UPDATE(RK3528_HDMI_SNKDET, RK3528_HDMI_SNKDET);
+	else
+		val = HIWORD_UPDATE(0, RK3528_HDMI_SNKDET);
+
+	regmap_write(hdmi->regmap, RK3528_VO_GRF_HDMI_MASK, val);
+}
+
 static int rockchip_hdmi_parse_dt(struct rockchip_hdmi *hdmi)
 {
+	struct platform_device *pdev = to_platform_device(hdmi->dev);
 	struct device_node *np = hdmi->dev->of_node;
+	struct resource *res;
 	int ret;
 
 	hdmi->regmap = syscon_regmap_lookup_by_phandle(np, "rockchip,grf");
@@ -224,6 +292,49 @@ static int rockchip_hdmi_parse_dt(struct rockchip_hdmi *hdmi)
 		if (ret != -EPROBE_DEFER)
 			dev_err(hdmi->dev, "failed to get grf clock\n");
 		return ret;
+	}
+
+	if (hdmi->chip_data == &rk3528_chip_data) {
+		hdmi->hpd_gpiod = devm_gpiod_get_optional(hdmi->dev, "hpd",
+							  GPIOD_IN);
+		if (IS_ERR(hdmi->hpd_gpiod)) {
+			ret = PTR_ERR(hdmi->hpd_gpiod);
+			if (ret != -EPROBE_DEFER)
+				dev_err(hdmi->dev, "error getting HPD GPIO\n");
+			return ret;
+		}
+
+		if (hdmi->hpd_gpiod) {
+			hdmi->hpd_irq = gpiod_to_irq(hdmi->hpd_gpiod);
+			if (hdmi->hpd_irq < 0)
+				return dev_err_probe(hdmi->dev, hdmi->hpd_irq,
+						     "failed to get hpd irq\n");
+
+			res = platform_get_resource(pdev, IORESOURCE_MEM, 1);
+			if (!res)
+				return dev_err_probe(hdmi->dev, -EINVAL,
+						     "failed to get gpio regs\n");
+
+			hdmi->gpio_base = devm_ioremap(hdmi->dev, res->start,
+						       resource_size(res));
+			if (IS_ERR(hdmi->gpio_base))
+				return dev_err_probe(hdmi->dev,
+						     PTR_ERR(hdmi->gpio_base),
+						     "Unable to map gpio regs\n");
+
+			dw_hdmi_rk3528_gpio_hpd_init(hdmi);
+
+			ret = devm_request_threaded_irq(hdmi->dev, hdmi->hpd_irq,
+							NULL,
+							rockchip_hdmi_hpd_irq_handler,
+							IRQF_TRIGGER_RISING |
+							IRQF_TRIGGER_FALLING |
+							IRQF_ONESHOT,
+							"hdmi-hpd", hdmi);
+			if (ret)
+				return dev_err_probe(hdmi->dev, ret,
+						     "failed to request hpd irq\n");
+		}
 	}
 
 	ret = devm_regulator_get_enable(hdmi->dev, "avdd-0v9");
@@ -698,6 +809,9 @@ static void dw_hdmi_rockchip_remove(struct platform_device *pdev)
 static int __maybe_unused dw_hdmi_rockchip_resume(struct device *dev)
 {
 	struct rockchip_hdmi *hdmi = dev_get_drvdata(dev);
+
+	if (hdmi->hpd_gpiod)
+		dw_hdmi_rk3528_gpio_hpd_init(hdmi);
 
 	dw_hdmi_resume(hdmi->hdmi);
 
