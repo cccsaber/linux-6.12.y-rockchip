@@ -1,0 +1,154 @@
+// SPDX-License-Identifier: (GPL-2.0+ OR MIT)
+/*
+ * Copyright (c) 2022 Rockchip Electronics Co., Ltd.
+ * Copyright (c) 2025 flippy <flippy@sina.com>
+ */
+
+#include "rk3528-hlink.dtsi"
+
+/ {
+	model = "H20plus";
+	compatible = "hlink,h20plus", "hlink,h28k", "rockchip,rk3528";
+
+	aliases {
+		ethernet1 = &pcie_eth;
+		mmc2 = &sdio0;
+	};
+
+	sdio_pwrseq: sdio-pwrseq {
+		compatible = "mmc-pwrseq-simple";
+		pinctrl-names = "default";
+		pinctrl-0 = <&wifi_enable_h>, <&clkm1_32k_out>;
+		post-power-on-delay-ms = <200>;
+		reset-gpios = <&gpio1 RK_PA6 GPIO_ACTIVE_LOW>;
+		status = "okay";
+	};
+
+	wireless_wlan: wireless-wlan {
+		compatible = "wlan-platdata";
+		wifi_chip_type = "aic8800";
+		pinctrl-names = "default";
+		pinctrl-0 = <&wifi_host_wake_irq>;
+		WIFI,host_wake_irq = <&gpio1 RK_PA7 GPIO_ACTIVE_HIGH>;
+		status = "okay";
+	};
+
+	wireless_bluetooth: wireless-bluetooth {
+		compatible = "bluetooth-platdata";
+		bt_port = "/dev/ttyS2";
+		uart_rts_gpios = <&gpio1 RK_PB2 GPIO_ACTIVE_LOW>;
+		pinctrl-names = "default", "rts_gpio";
+		pinctrl-0 = <&uart2m1_rtsn>, <&bt_reset_gpio>,
+			    <&bt_host_wake_irq>, <&bt_wake_gpio>;
+		pinctrl-1 = <&uart2m1_gpios>;
+		BT,reset_gpio = <&gpio1 RK_PC1 GPIO_ACTIVE_HIGH>;
+		BT,wake_gpio = <&gpio1 RK_PC4 GPIO_ACTIVE_HIGH>;
+		BT,wake_host_irq = <&gpio1 RK_PC2 GPIO_ACTIVE_HIGH>;
+		status = "okay";
+	};
+
+	gpio_keys: gpio-keys {
+		compatible = "gpio-keys";
+		status = "okay";
+
+		key-factory {
+			debounce-interval = <100>;
+			gpios = <&gpio4 RK_PB5 GPIO_ACTIVE_LOW>;
+			label = "Reset Button";
+			linux,code = <KEY_RESTART>;
+		};
+	};
+};
+
+&i2c3 {
+	status = "okay";
+};
+
+&pcie {
+	status = "disabled";
+	reset-gpios = <&gpio4 RK_PA3 GPIO_ACTIVE_HIGH>;
+	vpcie3v3-supply = <&vcc_3v3_s3>;
+
+	pinctrl-names = "default";
+	pinctrl-0 = <&pcie_rtl8111_isolate>;
+
+	pcie@0,0 {
+		reg = <0x000000 0 0 0 0>;
+		#address-cells = <3>;
+		#size-cells = <2>;
+
+		bus-range = <0x00 0x0f>;
+		device_type = "pci";
+		ranges;
+
+		pcie_eth: pcie-eth@0,0 {
+			compatible = "pci10ec,8168";
+			reg = <0x000000 0 0 0 0>;
+			realtek,led-data = <0x0870>;
+		};
+	};
+};
+
+&sdio0 {
+	no-sd;
+	no-mmc;
+	supports-sdio;
+	bus-width = <4>;
+	disable-wp;
+	cap-sd-highspeed;
+	cap-sdio-irq;
+	keep-power-in-suspend;
+	non-removable;
+	max-frequency = <50000000>;
+	mmc-pwrseq = <&sdio_pwrseq>;
+	pinctrl-names = "default";
+	pinctrl-0 = <&sdio0_bus4>, <&sdio0_cmd>, <&sdio0_clk>;
+	vmmc-supply = <&vcc_sd>;
+	vqmmc-supply = <&vccio_sd>;
+	status = "okay";
+};
+
+&uart2 {
+	pinctrl-names = "default";
+	pinctrl-0 = <&uart2m1_xfer>, <&uart2m1_ctsn>, <&uart2m1_rtsn>;
+	uart-has-rtscts;
+	status = "okay";
+};
+
+&pinctrl {
+	pcie {
+		pcie_rtl8111_isolate: pcie-rtl8111-isolate {
+			rockchip,pins = <4 RK_PA6 RK_FUNC_GPIO &pcfg_pull_up>;
+		};
+	};
+
+	sdio-pwrseq {
+		wifi_enable_h: wifi-enable-h {
+			rockchip,pins = <1 RK_PA6 RK_FUNC_GPIO &pcfg_pull_none>;
+		};
+	};
+
+	wireless-wlan {
+		wifi_host_wake_irq: wifi-host-wake-irq {
+			rockchip,pins = <1 RK_PA7 RK_FUNC_GPIO &pcfg_pull_down>;
+		};
+	};
+
+	wireless-bluetooth {
+		uart2m1_gpios: uart2m1-gpios {
+			rockchip,pins = <1 RK_PB2 RK_FUNC_GPIO &pcfg_pull_none>;
+		};
+
+		bt_reset_gpio: bt-reset-gpio {
+			rockchip,pins = <1 RK_PC1 RK_FUNC_GPIO &pcfg_pull_down>;
+		};
+
+		bt_host_wake_irq: bt-host-wake-irq {
+			rockchip,pins = <1 RK_PC2 RK_FUNC_GPIO &pcfg_pull_none>;
+		};
+
+		bt_wake_gpio: bt-wake-gpio {
+			rockchip,pins = <1 RK_PC4 RK_FUNC_GPIO &pcfg_pull_none>;
+		};
+	};
+};
