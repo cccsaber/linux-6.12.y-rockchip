@@ -815,6 +815,23 @@ static void rk3588_vop2_power_domain_enable_all(struct vop2 *vop2)
 	vop2_writel(vop2, RK3588_SYS_PD_CTRL, pd);
 }
 
+static bool vop2_hw_version_supported(const struct vop2 *vop2, u32 version)
+{
+	if (version == vop2->version)
+		return true;
+
+	/*
+	 * RK3528 boards are in the field with multiple VOP2 build revisions.
+	 * The DT compatible already selects the RK3528-specific register layout,
+	 * so accept build variants that keep the same major/minor revision.
+	 */
+	if (vop2->data->soc_id == 3528 &&
+	    (version & GENMASK(31, 16)) == (vop2->version & GENMASK(31, 16)))
+		return true;
+
+	return false;
+}
+
 static void vop2_enable(struct vop2 *vop2)
 {
 	int ret;
@@ -839,10 +856,17 @@ static void vop2_enable(struct vop2 *vop2)
 	}
 
 	version = vop2_readl(vop2, RK3568_VERSION_INFO);
-	if (version != vop2->version) {
-		drm_err(vop2->drm, "Hardware version(0x%08x) mismatch\n", version);
+	if (!vop2_hw_version_supported(vop2, version)) {
+		drm_err(vop2->drm,
+			"Hardware version(0x%08x) mismatch, expected 0x%08x\n",
+			version, vop2->version);
 		return;
 	}
+
+	if (version != vop2->version)
+		drm_info(vop2->drm,
+			 "Accepting VOP2 build variant 0x%08x for soc_id=%u\n",
+			 version, vop2->data->soc_id);
 
 	/*
 	 * rk3566 share the same vop version with rk3568, so
