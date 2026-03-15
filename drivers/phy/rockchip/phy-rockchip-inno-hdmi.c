@@ -245,6 +245,7 @@ struct inno_hdmi_phy {
 
 	/* platform data */
 	const struct inno_hdmi_phy_drv_data *plat_data;
+	const struct phy_config *phy_cfg;
 	int chip_version;
 
 	/* clk provider */
@@ -298,6 +299,8 @@ struct inno_hdmi_phy_drv_data {
 	const struct clk_ops		*clk_ops;
 	const struct phy_config		*phy_cfg_table;
 };
+
+#define INNO_HDMI_PHY_TABLE_ENTRY_SIZE	15
 
 static const struct pre_pll_config pre_pll_cfg_table[] = {
 	{ 25175000,  25175000,  3,  125, 3, 1, 1,  1, 3, 3,  4, 0, 0xe00000},
@@ -728,6 +731,9 @@ static int inno_hdmi_phy_power_on(struct phy *phy)
 		dev_err(inno->dev, "TMDS clock is zero!\n");
 		return -EINVAL;
 	}
+
+	if (inno->phy_cfg)
+		phy_cfg = inno->phy_cfg;
 
 	if (!inno->plat_data->ops->power_on)
 		return -EINVAL;
@@ -1691,6 +1697,22 @@ static const struct regmap_config inno_hdmi_phy_regmap_config = {
 	.max_register = 0x400,
 };
 
+static void inno_hdmi_phy_update_phy_table(const u32 *config,
+					   struct phy_config *phy_cfg,
+					   int phy_table_size)
+{
+	int i, j;
+
+	for (i = 0; i < phy_table_size; i++) {
+		phy_cfg[i].tmdsclock =
+			(unsigned long)config[i * INNO_HDMI_PHY_TABLE_ENTRY_SIZE];
+
+		for (j = 0; j < ARRAY_SIZE(phy_cfg[i].regs); j++)
+			phy_cfg[i].regs[j] =
+				(u8)config[i * INNO_HDMI_PHY_TABLE_ENTRY_SIZE + 1 + j];
+	}
+}
+
 static void inno_hdmi_phy_action(void *data)
 {
 	struct inno_hdmi_phy *inno = data;
@@ -1704,7 +1726,11 @@ static int inno_hdmi_phy_probe(struct platform_device *pdev)
 {
 	struct inno_hdmi_phy *inno;
 	struct phy_provider *phy_provider;
+	struct phy_config *phy_cfg;
 	void __iomem *regs;
+	u32 *phy_table;
+	int phy_table_entries;
+	int phy_table_len;
 	int ret;
 
 	inno = devm_kzalloc(&pdev->dev, sizeof(*inno), GFP_KERNEL);
@@ -1782,6 +1808,36 @@ static int inno_hdmi_phy_probe(struct platform_device *pdev)
 					     &inno_hdmi_phy_regmap_config);
 	if (IS_ERR(inno->regmap))
 		return PTR_ERR(inno->regmap);
+
+	phy_table_len = of_property_count_u32_elems(inno->dev->of_node,
+						    "rockchip,phy-table");
+	if (phy_table_len > 0) {
+		if (phy_table_len % INNO_HDMI_PHY_TABLE_ENTRY_SIZE)
+			return dev_err_probe(inno->dev, -EINVAL,
+					     "invalid rockchip,phy-table length\n");
+
+		phy_table = devm_kmalloc_array(inno->dev, phy_table_len,
+					       sizeof(*phy_table), GFP_KERNEL);
+		if (!phy_table)
+			return -ENOMEM;
+
+		ret = of_property_read_u32_array(inno->dev->of_node,
+						 "rockchip,phy-table",
+						 phy_table, phy_table_len);
+		if (ret)
+			return dev_err_probe(inno->dev, ret,
+					     "failed to read rockchip,phy-table\n");
+
+		phy_table_entries = phy_table_len / INNO_HDMI_PHY_TABLE_ENTRY_SIZE;
+		phy_cfg = devm_kcalloc(inno->dev, phy_table_entries + 1,
+				       sizeof(*phy_cfg), GFP_KERNEL);
+		if (!phy_cfg)
+			return -ENOMEM;
+
+		inno_hdmi_phy_update_phy_table(phy_table, phy_cfg,
+					       phy_table_entries);
+		inno->phy_cfg = phy_cfg;
+	}
 
 	/* only the newer rk3328 hdmiphy has an interrupt */
 	inno->irq = platform_get_irq(pdev, 0);
